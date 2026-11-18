@@ -1,0 +1,142 @@
+{
+  "products": [
+    {
+      "id": 1,
+      "name": "Dolo 650mg",
+      "batch": "B101",
+      "mrp": 30,
+      "rate": 25,
+      "gst": 12,
+      "stock": 1
+    },
+    {
+      "id": 2,
+      "name": "Amoxicillin 500",
+      "batch": "A205",
+      "mrp": 85,
+      "rate": 70,
+      "gst": 12,
+      "stock": 47
+    },
+    {
+      "id": 3,
+      "name": "Paracetamol Syrup",
+      "batch": "P99",
+      "mrp": 45,
+      "rate": 38,
+      "gst": 5,
+      "stock": 40
+    },
+    {
+      "id": 1794984852885,
+      "name": "Crocin 500",
+      "batch": "C102",
+      "mrp": 20,
+      "rate": 16,
+      "gst": 12,
+      "stock": 200
+    },
+    {
+      "id": 1794984852886,
+      "name": "Azithromycin 500",
+      "batch": "AZ99",
+      "mrp": 110,
+      "rate": 85,
+      "gst": 12,
+      "stock": 150
+    },
+    {
+      "id": 1794984852887,
+      "name": "Vitamin C Chewable",
+      "batch": "VC10",
+      "mrp": 45,
+      "rate": 35,
+      "gst": 12,
+      "stock": 299
+    },
+    {
+      "id": 1794984852888,
+      "name": "khasi Syrup",
+      "batch": "First Row",
+      "mrp": 100,
+      "rate": 50,
+      "gst": 12,
+      "stock": 150
+    }
+  ],
+  "bills": [
+    {
+      "billNo": 1,
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:20:20 pm",
+      "customer": "Cash Customer",
+      "details": "Dolo 650mg x2",
+      "total": 56
+    },
+    {
+      "billNo": 2,
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:21:07 pm",
+      "customer": "Cash Customer",
+      "details": "Amoxicillin 500 x2",
+      "total": 156.8
+    },
+    {
+      "billNo": 3,
+      "counter": "System-1 (Main)",
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:35:28 pm",
+      "customer": "Cash Customer",
+      "phone": "87954 83227",
+      "discount": 5,
+      "paymentMode": "Cash",
+      "details": "Amoxicillin 500 x1",
+      "total": 74.48
+    },
+    {
+      "billNo": 4,
+      "counter": "System-1 (Main)",
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:36:42 pm",
+      "customer": "Cash Customer",
+      "phone": "6394843510",
+      "discount": 0,
+      "paymentMode": "UPI",
+      "details": "Dolo 650mg x1",
+      "total": 28
+    },
+    {
+      "billNo": 5,
+      "counter": "System-1 (Main)",
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:43:53 pm",
+      "customer": "Cash Customer",
+      "phone": "8737373737",
+      "discount": 0,
+      "paymentMode": "Cash",
+      "details": "Vitamin C Chewable x1",
+      "total": 39.2
+    },
+    {
+      "billNo": 6,
+      "counter": "System-1 (Main)",
+      "isoDate": "2026-11-18",
+      "date": "18/11/2026, 12:53:10 pm",
+      "customer": "Cash Customer",
+      "phone": "",
+      "discount": 0,
+      "paymentMode": "Cash",
+      "details": "Dolo 650mg x108",
+      "total": 3024
+    }
+  ],
+  "purchaseOrders": [
+    {
+      "id": 1794986883062,
+      "itemName": "Dolo 650mg",
+      "supplier": "Main Wholesaler",
+      "orderQty": 1000,
+      "date": "2026-11-18"
+    }
+  ]
+}
