@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 5000;
 const SUPER_USER = (process.env.SUPER_USER || 'admin').toLowerCase();   // aapka (owner) login
 const SUPER_PASS = process.env.SUPER_PASS || 'admin@123';               // IMPORTANT: change karein
 
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');   // hosting par DATA_DIR ko pakke (persistent) disk par rakhein
 const STORES_FILE = path.join(DATA_DIR, 'stores.json');
 const OLD_DB = path.join(__dirname, 'marg_data.json');                  // purana single-store data (auto migrate)
 
@@ -124,6 +124,8 @@ function loadStores() {
     reg.stores.forEach(function (s) {
         if (!s.suppliers) s.suppliers = [];
         if (!s.subs) s.subs = [];
+        if (s.otpPhone === undefined) s.otpPhone = '';
+        s.suppliers.forEach(function (x) { if (x.otpPhone === undefined) x.otpPhone = ''; });
         if (s.subFrom === undefined) { s.subFrom = ''; s.subTo = ''; }          // purane store = lifetime (lock nahi hoga)
     });
     return reg;
@@ -149,14 +151,19 @@ function makeStore(reg, f) {
         active: true, createdAt: new Date().toLocaleString('en-IN'),
         subFrom: from, subTo: to,
         subs: [{ from: from, to: to, months: months, amount: parseFloat(f.amount) || 0, note: custom ? 'New account (custom dates)' : 'New account', at: todayStr() }],
-        suppliers: []
+        suppliers: [], otpPhone: normPhone(f.otpPhone)
     };
 }
 function initStores() {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
     if (!fs.existsSync(ADMIN_FILE)) {
         const salt = newSalt();
-        writeJson(ADMIN_FILE, { salt: salt, hash: hashPass(SUPER_PASS, salt) });
+        writeJson(ADMIN_FILE, { salt: salt, hash: hashPass(SUPER_PASS, salt), phone: normPhone(process.env.OWNER_PHONE) });
+    }
+    if (process.env.RESET_OWNER_PASS) {                // owner password bhool jayein to: RESET_OWNER_PASS=naya_password ke saath ek baar chalayein
+        const a = readJson(ADMIN_FILE, {}), salt = newSalt();
+        a.salt = salt; a.hash = hashPass(process.env.RESET_OWNER_PASS, salt); writeJson(ADMIN_FILE, a);
+        console.log('*** Owner password RESET ho gaya. Ab RESET_OWNER_PASS wali setting hata dein. ***');
     }
     if (fs.existsSync(STORES_FILE)) return;
     const reg = { stores: [] };
@@ -169,6 +176,126 @@ function initStores() {
 }
 
 /* ------------------------------- sessions ------------------------------- */
+/* ======================= MOBILE OTP (2-step login) =======================
+   Login ID + password sahi hone ke baad registered mobile par 6 digit OTP jata hai.
+   Settings (environment variables, start.bat mein):
+     SMS_PROVIDER=fast2sms   FAST2SMS_KEY=...   (optional DLT: FAST2SMS_SENDER_ID, FAST2SMS_TEMPLATE_ID)
+     SMS_PROVIDER=msg91      MSG91_KEY=...      MSG91_TEMPLATE_ID=...
+     OTP_MODE=on | off | test    (test = OTP sirf server console mein aata hai, sirf jaanch ke liye)
+     OWNER_PHONE=98XXXXXXXX      (owner ka mobile, pehli baar)                                    */
+const SMS_PROVIDER = (process.env.SMS_PROVIDER || '').toLowerCase();
+const OTP_MODE = (process.env.OTP_MODE || (SMS_PROVIDER ? 'on' : 'off')).toLowerCase();
+const otpOn = function () { return OTP_MODE === 'on' || OTP_MODE === 'test'; };
+const OTP_TTL = 5 * 60 * 1000, OTP_MAX_TRIES = 5, OTP_RESEND_WAIT = 30 * 1000, OTP_MAX_RESEND = 3, OTP_HOURLY = 6;
+const pending = new Map();           // pid -> {data, phone, salt, hash, exp, tries, resends, last}
+const otpSent = new Map();           // phone -> [bheje gaye samay]
+
+function normPhone(x) {
+    let d = String(x || '').replace(/\D/g, '');
+    if (d.length === 12 && d.indexOf('91') === 0) d = d.slice(2); else if (d.length === 11 && d[0] === '0') d = d.slice(1);
+    return /^[6-9]\d{9}$/.test(d) ? d : '';
+}
+const maskPhone = function (p) { return 'XXXXXX' + String(p).slice(-4); };
+const genOtp = function () { return String(crypto.randomInt(0, 1000000)).padStart(6, '0'); };
+const hashOtp = function (otp, salt) { return crypto.createHash('sha256').update(salt + otp).digest('hex'); };
+const otpInfo = function (phone) {
+    if (!otpOn()) return '';
+    return phone ? 'OTP: ' + maskPhone(phone) : '<span style="color:#b91c1c;font-weight:700">OTP mobile missing</span>';
+};
+
+async function sendSms(phone, otp) {
+    if (OTP_MODE === 'test') { console.log('[TEST OTP] ' + maskPhone(phone) + ' -> ' + otp); return; }
+    const sig = AbortSignal.timeout(12000);
+    if (SMS_PROVIDER === 'fast2sms') {
+        const dlt = process.env.FAST2SMS_SENDER_ID && process.env.FAST2SMS_TEMPLATE_ID;
+        const body = dlt ? { route: 'dlt', sender_id: process.env.FAST2SMS_SENDER_ID, message: process.env.FAST2SMS_TEMPLATE_ID, variables_values: otp, numbers: phone }
+            : { route: 'otp', variables_values: otp, numbers: phone };
+        const r = await fetch(process.env.FAST2SMS_URL || 'https://www.fast2sms.com/dev/bulkV2', {
+            method: 'POST', headers: { authorization: process.env.FAST2SMS_KEY, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: sig
+        });
+        const j = await r.json().catch(function () { return {}; });
+        if (!r.ok || j.return !== true) throw new Error('fast2sms: ' + (j.message || r.status));
+    } else if (SMS_PROVIDER === 'msg91') {
+        const q = new URLSearchParams({ template_id: process.env.MSG91_TEMPLATE_ID, mobile: '91' + phone, authkey: process.env.MSG91_KEY, otp: otp });
+        const r = await fetch((process.env.MSG91_URL || 'https://control.msg91.com/api/v5/otp') + '?' + q.toString(), { method: 'POST', headers: { 'content-type': 'application/json' }, signal: sig });
+        const j = await r.json().catch(function () { return {}; });
+        if (!r.ok || j.type !== 'success') throw new Error('msg91: ' + (j.message || r.status));
+    } else throw new Error('SMS provider set nahi hai');
+}
+function checkOtpConfig() {
+    if (OTP_MODE === 'on') {
+        const ok = (SMS_PROVIDER === 'fast2sms' && process.env.FAST2SMS_KEY) || (SMS_PROVIDER === 'msg91' && process.env.MSG91_KEY && process.env.MSG91_TEMPLATE_ID);
+        if (!ok) {
+            console.error('GALAT SETTINGS: OTP chalu hai par SMS provider ki settings poori nahi hain.');
+            console.error('fast2sms ke liye FAST2SMS_KEY, ya msg91 ke liye MSG91_KEY aur MSG91_TEMPLATE_ID set karein (start.bat dekhein).');
+            process.exit(1);
+        }
+        console.log('Mobile OTP: CHALU (' + SMS_PROVIDER + ')');
+    } else if (OTP_MODE === 'test') console.log('WARNING: OTP TEST MODE - OTP sirf yahan console mein dikhega. Asli istemaal ke liye mat chalayein.');
+    else console.log('Mobile OTP: BAND (SMS provider set nahi hai). Surakshit login ke liye start.bat mein SMS_PROVIDER set karein.');
+}
+setInterval(function () { const n = Date.now(); pending.forEach(function (v, k) { if (v.exp < n) pending.delete(k); }); }, 60000).unref();
+
+async function beginOtp(req, res, data, phone) {
+    const now = Date.now();
+    const hist = (otpSent.get(phone) || []).filter(function (t) { return now - t < 3600000; });
+    if (hist.length >= OTP_HOURLY) return res.redirect('/login?err=' + enc('Is number par bahut OTP bheje ja chuke hain. 1 ghante baad try karein.'));
+    const otp = genOtp(), salt = newSalt();
+    try { await sendSms(phone, otp); }
+    catch (e) { console.error('OTP bhejne mein error:', e.message); return res.redirect('/login?err=' + enc('OTP bhejne mein dikkat aayi. Thodi der baad dobara try karein.')); }
+    hist.push(now); otpSent.set(phone, hist);
+    const pid = crypto.randomBytes(24).toString('hex');
+    pending.set(pid, { data: data, phone: phone, salt: salt, hash: hashOtp(otp, salt), exp: now + OTP_TTL, tries: 0, resends: 0, last: now });
+    res.append('Set-Cookie', 'pid=' + pid + '; HttpOnly; Path=/; SameSite=Lax; Max-Age=600');
+    res.redirect('/verify-otp');
+}
+const landing = function (d) { return d.type === 'admin' ? '/admin' : (d.type === 'supplier' ? '/supplier' : '/'); };
+
+app.get('/verify-otp', function (req, res) {
+    const p = pending.get(cookieOf(req, 'pid'));
+    if (!p || p.exp < Date.now()) return res.redirect('/login?err=' + enc('OTP expire ho gaya. Dobara login karein.'));
+    const wait = Math.max(0, Math.ceil((p.last + OTP_RESEND_WAIT - Date.now()) / 1000));
+    const msg = req.query.err ? '<div class="alert">' + esc(req.query.err) + '</div>' : (req.query.ok ? '<div class="alert" style="background:#dcfce7;border-left-color:#16a34a;color:#14532d">' + esc(req.query.ok) + '</div>' : '');
+    res.send(page('OTP Verify',
+        '<div class="auth"><div class="auth-brand"><div class="logo" style="width:48px;height:48px;font-size:28px">+</div>' +
+        '<h1>Ek aur kadam: OTP se verify karein</h1><p>Surakshit login ke liye aapke registered mobile par 6 digit ka OTP bheja gaya hai. Ye 5 minute tak chalega.</p></div>' +
+        '<div class="auth-form"><div class="auth-box"><h2>OTP daalein</h2><p class="sub">' + esc(maskPhone(p.phone)) + ' par bheja gaya</p>' + msg +
+        '<form method="POST" action="/verify-otp"><label for="o">6 digit OTP</label>' +
+        '<input id="o" name="otp" class="w100" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required autofocus style="font-size:22px;letter-spacing:8px;text-align:center">' +
+        '<button class="btn btn-primary w100" style="margin-top:14px;padding:12px">Verify &amp; Login</button></form>' +
+        '<form method="POST" action="/resend-otp" style="margin-top:12px;text-align:center"><button id="rs" class="btn btn-gray btn-sm" disabled>OTP dobara bhejein</button></form>' +
+        '<p style="text-align:center;margin:14px 0 0"><a href="/login" style="color:var(--muted);font-size:13px">&larr; Wapas login par</a></p></div></div></div>' +
+        '<script>var w=' + wait + ',b=document.getElementById("rs");function t(){if(w>0){b.textContent="Dobara bhejein ("+w+"s)";w--;setTimeout(t,1000);}else{b.textContent="OTP dobara bhejein";b.disabled=false;}}t();</script>'));
+});
+app.post('/verify-otp', function (req, res) {
+    const pid = cookieOf(req, 'pid'), p = pending.get(pid);
+    if (!p || p.exp < Date.now()) { pending.delete(pid); return res.redirect('/login?err=' + enc('OTP expire ho gaya. Dobara login karein.')); }
+    const code = String(req.body.otp || '').replace(/\D/g, '');
+    if (code.length === 6 && safeEq(hashOtp(code, p.salt), p.hash)) {
+        pending.delete(pid);
+        res.append('Set-Cookie', 'pid=; Path=/; Max-Age=0');
+        startSession(res, Object.assign({}, p.data));
+        return res.redirect(landing(p.data));
+    }
+    p.tries++;
+    if (p.tries >= OTP_MAX_TRIES) { pending.delete(pid); return res.redirect('/login?err=' + enc('Bahut zyada galat OTP. Dobara login karein.')); }
+    res.redirect('/verify-otp?err=' + enc('Galat OTP. ' + (OTP_MAX_TRIES - p.tries) + ' koshish baaki.'));
+});
+app.post('/resend-otp', async function (req, res) {
+    const pid = cookieOf(req, 'pid'), p = pending.get(pid), now = Date.now();
+    if (!p || p.exp < now) return res.redirect('/login?err=' + enc('OTP expire ho gaya. Dobara login karein.'));
+    const back = function (m) { res.redirect('/verify-otp?err=' + enc(m)); };
+    if (now - p.last < OTP_RESEND_WAIT) return back('Thoda ruko, 30 second baad dobara bhej sakte hain.');
+    if (p.resends >= OTP_MAX_RESEND) { pending.delete(pid); return res.redirect('/login?err=' + enc('Resend ki limit poori ho gayi. Dobara login karein.')); }
+    const hist = (otpSent.get(p.phone) || []).filter(function (t) { return now - t < 3600000; });
+    if (hist.length >= OTP_HOURLY) return back('Is number par bahut OTP bheje ja chuke hain. 1 ghante baad try karein.');
+    const otp = genOtp(), salt = newSalt();
+    try { await sendSms(p.phone, otp); } catch (e) { console.error('OTP resend error:', e.message); return back('OTP bhejne mein dikkat aayi. Thodi der baad try karein.'); }
+    hist.push(now); otpSent.set(p.phone, hist);
+    p.salt = salt; p.hash = hashOtp(otp, salt); p.exp = now + OTP_TTL; p.last = now; p.resends++; p.tries = 0;
+    res.redirect('/verify-otp?ok=' + enc('Naya OTP bhej diya gaya.'));
+});
+
 const sessions = new Map();
 const SESSION_MS = 12 * 3600 * 1000;
 function cookieOf(req, name) {
@@ -180,7 +307,7 @@ function startSession(res, data) {
     const sid = crypto.randomBytes(24).toString('hex');
     data.created = Date.now();
     sessions.set(sid, data);
-    res.setHeader('Set-Cookie', 'sid=' + sid + '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + (SESSION_MS / 1000));
+    res.append('Set-Cookie', 'sid=' + sid + '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + (SESSION_MS / 1000));
 }
 app.use(function (req, res, next) {
     const sid = cookieOf(req, 'sid');
@@ -189,6 +316,9 @@ app.use(function (req, res, next) {
     req.session = s; req.sid = sid;
     next();
 });
+function toLogin(req, res) {                           // purani cookie hai par session nahi = server restart / 12 ghante
+    res.redirect('/login' + (req.sid ? '?err=' + enc('Session khatam ho gaya (server dobara chalne ya 12 ghante ke baad). Dobara login karein.') : ''));
+}
 function gate(req, res, store) {                      // account block / subscription khatam hone par turant bahar
     const sc = subState(store);
     if (BLOCKED.indexOf(sc.code) > -1) {
@@ -200,7 +330,7 @@ function gate(req, res, store) {                      // account block / subscri
 }
 function requireStore(req, res, next) {
     const s = req.session;
-    if (!s) return res.redirect('/login');
+    if (!s) return toLogin(req, res);
     if (s.type === 'admin') return res.redirect('/admin');
     if (s.type === 'supplier') return res.redirect('/supplier');
     const store = loadStores().stores.find(function (x) { return x.id === s.storeId; });
@@ -214,7 +344,7 @@ function requireStore(req, res, next) {
 }
 function requireSupplier(req, res, next) {
     const s = req.session;
-    if (!s) return res.redirect('/login');
+    if (!s) return toLogin(req, res);
     if (s.type === 'admin') return res.redirect('/admin');
     if (s.type === 'store') return res.redirect('/');
     const store = loadStores().stores.find(function (x) { return x.id === s.storeId; });
@@ -228,7 +358,7 @@ function requireSupplier(req, res, next) {
     next();
 }
 function requireAdmin(req, res, next) {
-    if (!req.session || req.session.type !== 'admin') return res.redirect('/login');
+    if (!req.session || req.session.type !== 'admin') return toLogin(req, res);
     next();
 }
 const fails = new Map();
@@ -502,28 +632,41 @@ app.get('/login', function (req, res) {
         '<label for="p">Password</label><input id="p" type="password" name="password" class="w100" required autocomplete="current-password">' +
         '<button type="submit" class="btn btn-primary w100" style="margin-top:18px;padding:12px">Login</button></form></div></div>'));
 });
-app.post('/login', function (req, res) {
+app.post('/login', async function (req, res) {
     const ip = req.ip;
-    const bad = function (m) { noteFail(ip); res.redirect('/login?err=' + enc(m)); };
+    const bad = function (m, why) { noteFail(ip); console.log('[login fail] ' + new Date().toLocaleString('en-IN') + ' | ID=' + String(req.body.username || '').trim() + ' | ' + (why || m)); res.redirect('/login?err=' + enc(m)); };
     if (tooMany(ip)) return res.redirect('/login?err=' + enc('Bahut zyada galat koshish. 10 minute baad try karein.'));
     const u = String(req.body.username || '').trim().toLowerCase();
     const p = String(req.body.password || '');
-    if (adminOk(u, p)) { fails.delete(ip); startSession(res, { type: 'admin' }); return res.redirect('/admin'); }
+    if (adminOk(u, p)) {
+        fails.delete(ip);
+        const ap = otpOn() ? normPhone((readJson(ADMIN_FILE, {}) || {}).phone) : '';
+        if (ap) return beginOtp(req, res, { type: 'admin' }, ap);          // owner ka mobile set hai to OTP lagega
+        startSession(res, { type: 'admin' });
+        return res.redirect('/admin');
+    }
     const reg = loadStores();
-    let st = reg.stores.find(function (s) { return s.username === u; }), sup = null;
+    let st = reg.stores.find(function (x) { return x.username === u; }), sup = null;
     if (st) {
-        if (!checkPass(p, st.salt, st.hash)) return bad('Login ID ya password galat hai.');
+        if (!checkPass(p, st.salt, st.hash)) return bad('Login ID ya password galat hai.', 'store mila par PASSWORD galat (owner panel se naya password set kar sakte hain)');
     } else {
-        reg.stores.forEach(function (s) { const x = (s.suppliers || []).find(function (y) { return y.username === u; }); if (x) { st = s; sup = x; } });
-        if (!sup || !checkPass(p, sup.salt, sup.hash)) return bad('Login ID ya password galat hai.');
+        reg.stores.forEach(function (x) { const y = (x.suppliers || []).find(function (z) { return z.username === u; }); if (y) { st = x; sup = y; } });
+        if (!sup && u === SUPER_USER) return bad('Login ID ya password galat hai.', 'OWNER password galat (yaad rahe: SUPER_PASS sirf pehli baar chalta hai; badalna ho to RESET_OWNER_PASS use karein)');
+        if (!sup) return bad('Login ID ya password galat hai.', 'ye Login ID is data folder mein hai hi nahi (data folder: ' + DATA_DIR + ')');
+        if (!checkPass(p, sup.salt, sup.hash)) return bad('Login ID ya password galat hai.', 'supplier mila par PASSWORD galat');
         if (!sup.active) return res.redirect('/login?err=' + enc('Ye supplier account band hai. Store se sampark karein.'));
     }
     const sc = subState(st);
-    if (BLOCKED.indexOf(sc.code) > -1) return res.redirect('/login?err=' + enc(sc.msg));
+    if (BLOCKED.indexOf(sc.code) > -1) { console.log('[login roka gaya] ' + new Date().toLocaleString('en-IN') + ' | ID=' + u + ' | karan: ' + sc.code + ' (' + sc.msg + ')'); return res.redirect('/login?err=' + enc(sc.msg)); }
     fails.delete(ip);
-    if (sup) { startSession(res, { type: 'supplier', storeId: st.id, supplierId: sup.id }); return res.redirect('/supplier'); }
-    startSession(res, { type: 'store', storeId: st.id, cart: [], scan: [] });
-    res.redirect('/');
+    const sess = sup ? { type: 'supplier', storeId: st.id, supplierId: sup.id } : { type: 'store', storeId: st.id, cart: [], scan: [] };
+    if (otpOn()) {
+        const phone = normPhone(sup ? sup.otpPhone : st.otpPhone);
+        if (!phone) return res.redirect('/login?err=' + enc('Is account par OTP mobile number set nahi hai. ' + (sup ? 'Store' : 'Owner') + ' se sampark karein.'));
+        return beginOtp(req, res, sess, phone);
+    }
+    startSession(res, sess);
+    res.redirect(sup ? '/supplier' : '/');
 });
 app.get('/logout', function (req, res) {
     if (req.sid) sessions.delete(req.sid);
@@ -610,11 +753,12 @@ app.get('/admin', requireAdmin, function (req, res) {
             '<div class="row cust" style="display:none"><div><label>From (start)</label><input type="date" name="from" value="' + ((s.subTo && s.subTo >= today) ? addDays(s.subTo, 1) : today) + '" class="w100"></div><div><label>To (end)</label><input type="date" name="to" class="w100"></div></div>' +
             '<div class="prev" style="font-size:13px;font-weight:600;margin:4px 0"></div><button class="btn btn-success btn-sm">Renew</button></form>' +
             '<form method="POST" action="/admin/set-dates">' + hid + '<b>Exact dates badlein</b><div class="row"><input type="date" name="from" value="' + esc(s.subFrom || today) + '" required><input type="date" name="to" value="' + esc(s.subTo || '') + '"></div><small>"To" khali = Lifetime</small><br><button class="btn btn-warning btn-sm">Save Dates</button></form>' +
+            '<form method="POST" action="/admin/set-store-phone" autocomplete="off">' + hid + '<b>OTP Mobile number</b><input name="otpPhone" class="w100" placeholder="10 digit mobile" pattern="[6-9][0-9]{9}" inputmode="numeric" value="' + esc(s.otpPhone || '') + '" required><button class="btn btn-gray btn-sm">Save Mobile</button></form>' +
             '<form method="POST" action="/admin/reset-password" autocomplete="off">' + hid + '<b>Naya password set karein</b><input type="password" name="password" class="w100" placeholder="Naya password (min 6)" minlength="6" required autocomplete="new-password"><button class="btn btn-gray btn-sm">Set Password</button></form>' +
             '<form method="POST" action="/admin/toggle-store">' + hid + '<button class="btn btn-sm ' + (s.active ? 'btn-danger' : 'btn-success') + '">' + (s.active ? 'Block this store' : 'Unblock this store') + '</button></form>' +
             '<div><b>Subscription history</b><ul style="margin:6px 0 0;padding-left:18px;font-size:13px;line-height:1.7">' + (hist || '<li>-</li>') + '</ul></div>' + delForm + '</div></details>';
         return '<tr data-status="' + sc.code + '" data-q="' + esc((s.name + ' ' + s.username + ' ' + s.phone).toLowerCase()) + '">' +
-            '<td><b>' + esc(s.name) + '</b><br><small>Login ID: ' + esc(s.username) + (s.phone ? ' | ' + esc(s.phone) : '') + '</small></td>' +
+            '<td><b>' + esc(s.name) + '</b><br><small>Login ID: ' + esc(s.username) + (s.phone ? ' | ' + esc(s.phone) : '') + '</small><br><small>' + otpInfo(s.otpPhone) + '</small></td>' +
             '<td>' + planText(s) + '</td><td>' + planBadge(s) + '</td>' +
             '<td>' + inr(t) + '<br><small>' + n + ' bills today | ' + (s.suppliers || []).length + ' suppliers</small></td><td>' + manage + '</td></tr>';
     }).join('');
@@ -627,7 +771,8 @@ app.get('/admin', requireAdmin, function (req, res) {
         '<select id="sf" style="flex:1"><option value="">All status</option><option value="active">Active</option><option value="expiring">Expiring</option><option value="expired">Expired</option><option value="disabled">Blocked</option><option value="upcoming">Not started</option></select></div>' +
         '<script>function ff(){var q=document.getElementById("sq").value.toLowerCase(),f=document.getElementById("sf").value;document.querySelectorAll("#stores tbody tr").forEach(function(r){r.style.display=(r.dataset.q.indexOf(q)>-1&&(!f||r.dataset.status===f))?"":"none"})}document.getElementById("sq").oninput=ff;document.getElementById("sf").onchange=ff;</script>';
     const addForm = '<form method="POST" action="/admin/add-store" autocomplete="off" class="planform"><div class="row">' +
-        '<input name="name" placeholder="Medical store ka naam" required><input name="phone" placeholder="Phone (optional)"></div>' +
+        '<input name="name" placeholder="Medical store ka naam" required><input name="phone" placeholder="Business phone (optional)"></div>' +
+        '<div class="row"><input name="otpPhone" placeholder="OTP Mobile (10 digit) - login ka OTP yahin aayega" pattern="[6-9][0-9]{9}" inputmode="numeric"' + (otpOn() ? ' required' : '') + '></div>' +
         '<div class="row"><input name="username" placeholder="Login ID (a-z, 0-9)" pattern="[a-zA-Z0-9_.\\-]{3,20}" required autocomplete="off"><input type="password" name="password" placeholder="Password (min 6)" minlength="6" required autocomplete="new-password"></div>' +
         '<div class="row"><div><label>Subscription start</label><input type="date" name="from" value="' + today + '" class="w100" required></div>' +
         '<div><label>Plan / Kitne mahine</label><select name="months" class="w100">' + PLAN_OPTS + '</select></div>' +
@@ -641,10 +786,19 @@ app.get('/admin', requireAdmin, function (req, res) {
         '<p style="font-size:13px;color:var(--muted);margin:6px 0">Customer ke purane software ki stock Excel/CSV uske store mein daal dein. Columns: Name, Batch, Expiry, MRP, Rate, GST, PackSize, Stock.</p>' +
         '<button class="btn btn-primary">Import Stock into Store</button></form>';
     const ownerPw = '<form method="POST" action="/admin/change-owner-password" autocomplete="off"><div class="row"><input type="password" name="oldPass" placeholder="Purana password" required autocomplete="current-password"><input type="password" name="newPass" placeholder="Naya password (min 8)" minlength="8" required autocomplete="new-password"></div><button class="btn btn-warning" style="margin-top:8px">Change Owner Password</button></form>';
+    const aph = normPhone((readJson(ADMIN_FILE, {}) || {}).phone);
+    const otpStatus = OTP_MODE === 'on'
+        ? (aph ? '<div class="alert" style="background:#dcfce7;border-left-color:#16a34a;color:#14532d">Mobile OTP chalu hai (' + esc(SMS_PROVIDER) + '). Sabhi logins par OTP lagega.</div>'
+            : '<div class="alert" style="background:var(--red-bg);border-left-color:#dc2626;color:#7f1d1d">OTP chalu hai par <b>aapka (owner) mobile number set nahi hai</b>, isliye aap par abhi OTP nahi lag raha. Neeche "Owner Mobile" se number set karein.</div>')
+        : (OTP_MODE === 'test' ? '<div class="alert" style="background:var(--red-bg);border-left-color:#dc2626;color:#7f1d1d">TEST MODE: OTP sirf server console mein aa raha hai. Asli istemaal ke liye SMS_PROVIDER set karein.</div>'
+            : '<div class="alert">Mobile OTP abhi <b>band</b> hai (SMS provider set nahi). Surakshit login ke liye start.bat mein SMS_PROVIDER set karein.</div>');
+    const otpCard = '<div class="card"><h2 class="card-title">Owner Mobile (OTP)</h2><p style="margin-top:0">Abhi: <b>' + (aph ? maskPhone(aph) : 'set nahi hai') + '</b></p>' +
+        '<form method="POST" action="/admin/set-owner-phone" autocomplete="off"><input class="w100" name="phone" placeholder="Naya mobile (10 digit)" pattern="[6-9][0-9]{9}" inputmode="numeric" required>' +
+        '<input class="w100" type="password" name="password" placeholder="Owner password (confirm ke liye)" required autocomplete="current-password"><button class="btn btn-warning" style="margin-top:8px">Save Mobile</button></form></div>';
     res.send(page('Owner Panel',
         '<div class="topbar"><div class="brand"><div class="logo">+</div><div><b>Super Admin</b><small>Smart Billing &amp; Stock Hub</small></div></div>' +
         '<div class="top-right"><a href="/logout" class="btn btn-gray btn-sm">Logout</a></div></div>' +
-        '<div class="main" style="margin:0 auto;position:relative;z-index:1">' + msg +
+        '<div class="main" style="margin:0 auto;position:relative;z-index:1">' + msg + otpStatus +
         '<div class="stats"><div class="stat"><span>Total Stores</span><b>' + reg.stores.length + '</b></div><div class="stat"><span>Active</span><b style="color:#15803d">' + active + '</b></div>' +
         '<div class="stat"><span>Renewal Chahiye (15 din / Expired)</span><b style="color:var(--red)">' + need + '</b></div><div class="stat"><span>Total Collected</span><b style="color:var(--teal)">' + inr(money) + '</b></div></div>' +
         alertCard + '<div class="card"><h2 class="card-title">All Stores &amp; Subscriptions</h2>' + filter +
@@ -652,7 +806,7 @@ app.get('/admin', requireAdmin, function (req, res) {
         '<p style="color:var(--muted);font-size:13px;margin-bottom:0">Privacy: yahan sirf summary dikhti hai. Kisi ka password kabhi nahi dikhta, sirf naya set kar sakte hain.</p></div>' +
         '<div class="grid-2"><div class="card"><h2 class="card-title">Naya Store Account Banayein</h2>' + addForm + '</div>' +
         '<div><div class="card"><h2 class="card-title">Customer ka Purana Data Import</h2>' + importForm + '</div>' +
-        '<div class="card"><h2 class="card-title">Owner Password</h2>' + ownerPw + '</div></div></div>' + PLAN_JS + '</div>'));
+        otpCard + '<div class="card"><h2 class="card-title">Owner Password</h2>' + ownerPw + '</div></div></div>' + PLAN_JS + '</div>'));
 });
 app.post('/admin/add-store', requireAdmin, function (req, res) {
     const reg = loadStores();
@@ -665,7 +819,10 @@ app.post('/admin/add-store', requireAdmin, function (req, res) {
     if (pin && !/^[0-9]{4,8}$/.test(pin)) return back('Admin PIN 4 se 8 digit ka hona chahiye.');
     if (usernameTaken(reg, username)) return back('Ye Login ID pehle se kisi aur ke paas hai.');
     if (req.body.months === 'custom' && (!isoDate(req.body.from) || !isoDate(req.body.to) || req.body.to < req.body.from)) return back('Custom plan ke liye sahi start aur end date chunein (end date start se pehle nahi ho sakti).');
-    const s = makeStore(reg, { name: name, username: username, password: password, phone: req.body.phone, from: req.body.from, to: req.body.to, months: req.body.months, amount: req.body.amount, pin: pin });
+    const otpPhone = normPhone(req.body.otpPhone);
+    if (req.body.otpPhone && !otpPhone) return back('OTP mobile number sahi nahi hai (10 digit, 6-9 se shuru).');
+    if (otpOn() && !otpPhone) return back('OTP chalu hai, isliye OTP mobile number zaroori hai.');
+    const s = makeStore(reg, { name: name, username: username, password: password, phone: req.body.phone, otpPhone: otpPhone, from: req.body.from, to: req.body.to, months: req.body.months, amount: req.body.amount, pin: pin });
     reg.stores.push(s); saveStores(reg);
     writeJson(storeFile(s.id), { products: [], bills: [], purchaseOrders: [], incoming: [] });
     back('Store "' + name + '" ban gaya. Login ID: ' + username + (s.subTo ? ' | Subscription: ' + fmtDate(s.subFrom) + ' se ' + fmtDate(s.subTo) + ' tak' : ' | Lifetime'));
@@ -720,6 +877,19 @@ app.post('/admin/reset-password', requireAdmin, function (req, res) {
         return res.redirect('/admin?msg=' + enc(s.name + ': naya password set ho gaya.'));
     }
     res.redirect('/admin?msg=' + enc('Password kam se kam 6 character ka ho.'));
+});
+app.post('/admin/set-store-phone', requireAdmin, function (req, res) {
+    const reg = loadStores(), s = reg.stores.find(function (x) { return x.id === req.body.id; }), ph = normPhone(req.body.otpPhone);
+    if (!s || !ph) return res.redirect('/admin?msg=' + enc('Sahi 10 digit mobile number daalein.'));
+    s.otpPhone = ph; saveStores(reg);
+    res.redirect('/admin?msg=' + enc(s.name + ': OTP mobile ' + maskPhone(ph) + ' set ho gaya.'));
+});
+app.post('/admin/set-owner-phone', requireAdmin, function (req, res) {
+    const a = readJson(ADMIN_FILE, null), ph = normPhone(req.body.phone);
+    if (!a || !adminOk(SUPER_USER, String(req.body.password || ''))) { noteFail(req.ip); return res.redirect('/admin?msg=' + enc('Owner password galat hai.')); }
+    if (!ph) return res.redirect('/admin?msg=' + enc('Sahi 10 digit mobile number daalein.'));
+    a.phone = ph; writeJson(ADMIN_FILE, a);
+    res.redirect('/admin?msg=' + enc('Owner mobile ' + maskPhone(ph) + ' set ho gaya.'));
 });
 app.get('/admin/store-backup/:id', requireAdmin, function (req, res) {
     const s = loadStores().stores.find(function (x) { return x.id === req.params.id; });
@@ -901,18 +1071,20 @@ function tabSettings(req) {
         '<label>Address</label><input class="w100" name="address" value="' + esc(st.address) + '"><div class="row"><div><label>Phone</label><input class="w100" name="phone" value="' + esc(st.phone) + '"></div>' +
         '<div><label>GSTIN / DL No.</label><input class="w100" name="gstin" value="' + esc(st.gstin) + '"></div></div>' +
         '<button class="btn btn-primary" style="margin-top:12px">Save Details</button><p style="color:var(--muted);font-size:13px">Ye details bill print par dikhengi.</p></form>';
-    const subCard = '<div class="card"><h2 class="card-title">Subscription</h2><p style="margin:0;line-height:1.9">Plan: ' + planText(st) + '<br>Status: ' + planBadge(st) + '</p></div>';
+    const subCard = '<div class="card"><h2 class="card-title">Subscription</h2><p style="margin:0;line-height:1.9">Plan: ' + planText(st) + '<br>Status: ' + planBadge(st) + (otpOn() ? '<br>OTP Mobile: <b>' + (st.otpPhone ? maskPhone(st.otpPhone) : 'set nahi hai') + '</b> <small>(badalne ke liye owner se kahein)</small>' : '') + '</p></div>';
     const sec = '<form method="POST" action="/change-pin" style="margin-bottom:22px"><b>Admin PIN badlein (delete lock)</b>' +
         '<input type="password" class="w100" name="oldPin" placeholder="Purana PIN" required autocomplete="off"><input type="password" class="w100" name="newPin" placeholder="Naya PIN (4-8 digit)" pattern="[0-9]{4,8}" required autocomplete="off">' +
         '<button class="btn btn-warning" style="margin-top:8px">Change PIN</button></form>' +
         '<form method="POST" action="/change-password"><b>Login password badlein</b><input type="password" class="w100" name="oldPass" placeholder="Purana password" required autocomplete="current-password">' +
         '<input type="password" class="w100" name="newPass" placeholder="Naya password (min 6)" minlength="6" required autocomplete="new-password"><button class="btn btn-warning" style="margin-top:8px">Change Password</button></form>';
     const sups = (st.suppliers || []).map(function (x) {
-        return '<tr><td><b>' + esc(x.name) + '</b></td><td>' + esc(x.username) + '</td><td>' + (x.active ? '<span class="badge b-green" style="margin-left:0">Active</span>' : '<span class="badge b-red" style="margin-left:0">Blocked</span>') + '</td>' +
+        return '<tr><td><b>' + esc(x.name) + '</b></td><td>' + esc(x.username) + '<br><small>' + otpInfo(x.otpPhone) + '</small></td><td>' + (x.active ? '<span class="badge b-green" style="margin-left:0">Active</span>' : '<span class="badge b-red" style="margin-left:0">Blocked</span>') + '</td>' +
             '<td style="white-space:nowrap"><form method="POST" action="/toggle-supplier" style="display:inline"><input type="hidden" name="id" value="' + x.id + '"><button class="btn btn-sm ' + (x.active ? 'btn-danger' : 'btn-success') + '">' + (x.active ? 'Block' : 'Unblock') + '</button></form> ' +
+            '<form method="POST" action="/set-supplier-phone" style="display:inline-flex;gap:5px"><input type="hidden" name="id" value="' + x.id + '"><input name="otpPhone" placeholder="Mobile" pattern="[6-9][0-9]{9}" required style="width:105px;margin:0;padding:6px"><button class="btn btn-gray btn-sm">Mobile</button></form> ' +
             '<form method="POST" action="/reset-supplier-password" style="display:inline-flex;gap:5px"><input type="hidden" name="id" value="' + x.id + '"><input type="password" name="password" placeholder="Naya password" minlength="6" required autocomplete="new-password" style="width:120px;margin:0;padding:6px"><button class="btn btn-gray btn-sm">Set</button></form></td></tr>';
     }).join('');
     const addSup = '<form method="POST" action="/add-supplier" autocomplete="off" style="margin-top:12px"><b>Naya Supplier / Wholesaler jodein</b><div class="row"><input name="name" placeholder="Supplier ka naam" required><input name="username" placeholder="Login ID" pattern="[a-zA-Z0-9_.\\-]{3,20}" required autocomplete="off"></div>' +
+        '<input name="otpPhone" class="w100" placeholder="Supplier ka OTP mobile (10 digit)" pattern="[6-9][0-9]{9}" inputmode="numeric"' + (otpOn() ? ' required' : '') + '>' +
         '<input type="password" name="password" class="w100" placeholder="Password (min 6)" minlength="6" required autocomplete="new-password"><button class="btn btn-success" style="margin-top:8px">+ Add Supplier</button></form>';
     const supCard = '<div class="card"><h2 class="card-title">Suppliers (Bill Upload Access)</h2>' +
         '<p style="margin-top:0;line-height:1.6;color:var(--muted)">Supplier apne login se jo maal bhejega wo <b>Supplier Bills</b> tab mein aayega. Aap check karke confirm karenge tabhi stock mein judega.</p>' +
@@ -1289,10 +1461,20 @@ app.post('/add-supplier', requireStore, function (req, res) {
     const name = String(req.body.name || '').trim(), username = String(req.body.username || '').trim().toLowerCase(), password = String(req.body.password || '');
     if (!name || !/^[a-z0-9_.\-]{3,20}$/.test(username) || password.length < 6) return go(res, 'settings', 'Naam, valid Login ID aur 6+ character password zaroori hai.');
     if (usernameTaken(reg, username)) return go(res, 'settings', 'Ye Login ID pehle se kisi aur ke paas hai, doosri chunein.');
+    const otpPhone = normPhone(req.body.otpPhone);
+    if (req.body.otpPhone && !otpPhone) return go(res, 'settings', 'OTP mobile number sahi nahi hai (10 digit, 6-9 se shuru).');
+    if (otpOn() && !otpPhone) return go(res, 'settings', 'OTP chalu hai, isliye supplier ka mobile number zaroori hai.');
     const salt = newSalt();
-    s.suppliers.push({ id: String(Date.now()), name: name, username: username, salt: salt, hash: hashPass(password, salt), active: true, createdAt: todayStr() });
+    s.suppliers.push({ id: String(Date.now()), name: name, username: username, salt: salt, hash: hashPass(password, salt), active: true, otpPhone: otpPhone, createdAt: todayStr() });
     saveStores(reg);
     go(res, 'settings', 'Supplier "' + name + '" ban gaya. Login ID: ' + username);
+});
+app.post('/set-supplier-phone', requireStore, function (req, res) {
+    const reg = loadStores(), s = reg.stores.find(function (x) { return x.id === req.store.id; });
+    const x = s.suppliers.find(function (y) { return y.id === req.body.id; }), ph = normPhone(req.body.otpPhone);
+    if (!x || !ph) return go(res, 'settings', 'Sahi 10 digit mobile number daalein.');
+    x.otpPhone = ph; saveStores(reg);
+    go(res, 'settings', x.name + ': OTP mobile ' + maskPhone(ph) + ' set ho gaya.');
 });
 app.post('/toggle-supplier', requireStore, function (req, res) {
     const reg = loadStores(), s = reg.stores.find(function (x) { return x.id === req.store.id; });
@@ -1447,8 +1629,11 @@ app.get('/supplier/sample', requireSupplier, function (req, res) {
 /* ------------------------------ start ------------------------------ */
 initStores();
 ensureTessdata();
+checkOtpConfig();
 app.listen(PORT, '0.0.0.0', function () {
     console.log('Smart Billing & Stock Hub (Multi-Store) chalu hai: http://localhost:' + PORT);
+    const nStores = loadStores().stores.length;
+    console.log('Data folder: ' + DATA_DIR + '   | stores mile: ' + nStores + (nStores === 0 ? '   <-- KHALI! Agar pehle stores bane the to ye galat/naya folder hai, ya purana data hat gaya.' : ''));
     console.log('Super Admin panel: http://localhost:' + PORT + '/admin  (Login ID: ' + SUPER_USER + ')');
     console.log('Pehli baar SUPER_PASS set karke chalayein, ya turant Owner Password section se badal dein.');
 });
